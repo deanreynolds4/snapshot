@@ -35,7 +35,15 @@
     Path to the manifest JSON written by save-vm-snapshot-manifest.ps1.
 
 .PARAMETER TargetVmName
-    Name for the replacement VM. Must not already exist.
+    Name for the replacement VM. Defaults to the SOURCE VM's name, which is usually what you
+    want: the Azure resource name shows up in Azure Backup item identity, private DNS
+    auto-registration and every alert, role assignment and policy scoped to the VM's
+    resource ID.
+
+    Keeping the name requires the replacement to live somewhere the name is free - a
+    different resource group, or the same resource group once the source VM has been
+    deleted. See "Choosing the replacement's name" in README.md, and read the preflight
+    report, which spells out exactly what your combination does and does not preserve.
 
 .PARAMETER TargetVmSize
     The new VM size, for example Standard_E8ds_v5. Preflight verifies it has a temp disk.
@@ -138,12 +146,13 @@
     a manifest captured in the LiveUnsafe consistency mode. Use deliberately.
 
 .EXAMPLE
-    .\new-vm-from-snapshot-manifest.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-20260901-101500.json -TargetVmName SQLPROD01-ds -TargetVmSize Standard_E8ds_v5 -PreflightOnly
+    .\new-vm-from-snapshot-manifest.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-20260901-101500.json -TargetResourceGroupName rg-sqlprod-v2 -TargetVmSize Standard_E8ds_v5 -PreflightOnly
 
     Full validation and carryover report. Creates nothing. Run this first, every time.
+    The replacement keeps the source VM's name, so it needs its own resource group.
 
 .EXAMPLE
-    .\new-vm-from-snapshot-manifest.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-20260901-101500.json -TargetVmName SQLPROD01-ds -TargetVmSize Standard_E8ds_v5 -UseSourcePrivateIp
+    .\new-vm-from-snapshot-manifest.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-20260901-101500.json -TargetResourceGroupName rg-sqlprod-v2 -TargetVmSize Standard_E8ds_v5 -RestoreMode ImageFirstSwap -UseSourcePrivateIp
 
     Builds the replacement on a temp-disk size and claims the original private IP, which
     release-vm-network-address.ps1 must already have freed. Leaves the VM stopped.
@@ -162,8 +171,6 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ManifestPath,
 
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
     [string]$TargetVmName,
 
     [Parameter(Mandatory = $true)]
@@ -1573,22 +1580,47 @@ function New-PreflightReport {
         $warnings.Add(("{0} disk(s) use Write Accelerator, which is only supported on M-series sizes. It will not be applied to '{1}'." -f $writeAcceleratorDisks.Count, $Plan.VmSize))
     }
 
-    # --- Backup identity. Azure Backup keys an IaaS VM item on subscription + resource
-    # group + VM NAME, not on the VM's unique ID or its disk IDs.
-    $backupSection = Get-ObjectPropertyValue -InputObject $Manifest -PropertyNames @('BackupProtection')
-    if ($backupSection -and $backupSection.Status -eq 'Captured' -and $backupSection.Data -and $backupSection.Data.IsProtected) {
-        $sameIdentity = ($Plan.VmName -eq $sourceVm.Name) -and ($Plan.ResourceGroupName -eq $sourceVm.ResourceGroupName) -and ($Plan.SubscriptionId -eq $sourceVm.SubscriptionId)
-        if (-not $sameIdentity) {
-            $warnings.Add(("BACKUP HISTORY WILL NOT TRANSFER. Azure Backup identifies a VM by subscription + resource group + NAME. The replacement is '{0}' but the source is '{1}', so the new VM becomes a separate backup item with no history and takes a fresh full initial backup, while the source VM's existing recovery points remain under the old item - still restorable, still billed. Recovery points only reattach automatically when the replacement has the SAME name in the SAME resource group and subscription." -f $Plan.VmName, $sourceVm.Name))
-        }
-        else {
-            $warnings.Add('The replacement VM has the same name, resource group and subscription as the source, so the existing Recovery Services vault item and its recovery points should reattach automatically. Do NOT stop protection with data deletion at any point.')
-        }
-    }
+    # --- Naming and identity. An Azure VM's resource ID is
+    # /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/{name},
+    # so the name alone does not preserve identity - the resource group and subscription are
+    # equally part of it. Azure Backup, in particular, keys an IaaS VM protected item on
+    # subscription + resource group + NAME, not on the VM's unique ID or its disk IDs.
+    $sameName = ($Plan.VmName -eq $sourceVm.Name)
+    $sameResourceGroup = ($Plan.ResourceGroupName -eq $sourceVm.ResourceGroupName)
+    $sameSubscription = ($Plan.SubscriptionId -eq $sourceVm.SubscriptionId)
+    $sameResourceId = $sameName -and $sameResourceGroup -and $sameSubscription
 
-    # --- Private DNS auto-registration follows the VM NAME, not the IP.
-    if ($Plan.VmName -ne $sourceVm.Name) {
-        $warnings.Add(("Private DNS auto-registration keys off the VM name, not the address. Renaming '{0}' to '{1}' changes the auto-registered A record even though the IP is preserved. Anything resolving the old name needs a manual record or a CNAME." -f $sourceVm.Name, $Plan.VmName))
+    $backupSection = Get-ObjectPropertyValue -InputObject $Manifest -PropertyNames @('BackupProtection')
+    $isProtected = $backupSection -and $backupSection.Status -eq 'Captured' -and $backupSection.Data -and $backupSection.Data.IsProtected
+
+    if ($sameResourceId) {
+        $warnings.Add('IDENTITY PRESERVED. The replacement has the same name, resource group and subscription, so its ARM resource ID is byte-identical to the source''s. Alert rules, role assignments, policy assignments, automation and anything else scoped to that resource ID keep working untouched. This requires the source VM to have been DELETED first - its disks are retained and, with your snapshots, are the rollback.')
+
+        if ($isProtected) {
+            $warnings.Add('Azure Backup: because the identity matches, the existing vault item and its recovery points should reattach automatically and the backup chain continues. Do NOT stop protection with data deletion at any point in the cutover.')
+        }
+
+        $warnings.Add('Azure Update Manager has a known issue where schedules against a machine deleted and re-created with the SAME resource ID inside 8 hours fail with ShutdownOrUnresponsive. Re-create the maintenance assignments after cutover and expect the first scheduled run to be unreliable.')
+        $warnings.Add('Creating a NIC named after the source VM may collide with the source''s own NIC, which survives the VM deletion. -ReuseSourceNic avoids the collision entirely and preserves the IP, NSG, ASG and load balancer membership exactly.')
+    }
+    elseif ($sameName) {
+        $where = 'resource group'
+        if (-not $sameSubscription) { $where = 'subscription' }
+
+        $warnings.Add(("SAME NAME, DIFFERENT {0}. The guest keeps its hostname, SIDs and domain membership regardless - those travel on the OS disk - and the Azure resource name matches too. But the ARM RESOURCE ID changes, because the resource group and subscription are part of it. Anything scoped to the old resource ID - metric alerts, role assignments, policy assignments, automation runbooks, Update Manager assignments - does not follow and must be re-pointed." -f $where.ToUpper()))
+
+        if ($isProtected) {
+            $warnings.Add(("BACKUP HISTORY WILL NOT TRANSFER. Azure Backup identifies a protected item by subscription + resource group + name, so moving to a different {0} makes this a brand-new item: a fresh full initial backup, and no access to the old restore points from the new item. The source VM's existing recovery points stay under its own item - still restorable, still billed, until they age out. If continuous backup history matters more than keeping the source VM as a rollback, delete the source VM instead and rebuild into its own resource group." -f $where))
+        }
+
+        $warnings.Add('While both VMs exist they share a name. That is legal in Azure, but it makes the portal, scripts and Resource Graph queries ambiguous - always qualify by resource group. It is also why they must never run at once: they would fight over the same Active Directory computer account and private DNS record.')
+    }
+    else {
+        $warnings.Add(("The replacement is named '{0}' rather than '{1}'. Private DNS auto-registration keys off the VM name, so the auto-registered A record changes even though the IP is preserved; anything resolving the old name needs a manual record or a CNAME." -f $Plan.VmName, $sourceVm.Name))
+
+        if ($isProtected) {
+            $warnings.Add('BACKUP HISTORY WILL NOT TRANSFER. Azure Backup identifies a protected item by subscription + resource group + name, so a renamed replacement becomes a separate item with no history and takes a fresh full initial backup. The source VM''s recovery points remain under the old item, still restorable and still billed.')
+        }
     }
 
     # --- Marketplace plan
@@ -1721,13 +1753,6 @@ function New-PreflightReport {
 $originalContext = $null
 
 try {
-    # This script creates disks, NICs and a VM. When it fails part way, the inventory of what
-    # it already made is the most valuable thing on screen - so put it in a file too.
-    if (-not $PreflightOnly) {
-        $transcriptDirectory = Split-Path -Path (Resolve-Path -LiteralPath $ManifestPath).ProviderPath -Parent
-        $script:TranscriptPath = Start-RunTranscript -Path (Join-Path -Path $transcriptDirectory -ChildPath ("restore-{0}-{1}.log" -f $TargetVmName, (New-BatchTimestamp)))
-    }
-
     Write-Step 'Checking prerequisites'
     # Az.Resources is not optional here: Get-AzResourceGroup is called before anything else.
     Assert-AzModule -Name @('Az.Accounts', 'Az.Compute', 'Az.Network', 'Az.Resources')
@@ -1756,6 +1781,18 @@ try {
 
     Write-Detail ("Source VM: {0} ({1})" -f $manifest.SourceVm.Name, $manifest.SourceVm.VmSize)
     Write-Detail ("Captured : {0} in {1} mode" -f $manifest.GeneratedAtUtc, $manifest.Capture.ConsistencyMode)
+
+    if ([string]::IsNullOrWhiteSpace($TargetVmName)) {
+        $TargetVmName = $manifest.SourceVm.Name
+        Write-Detail ("No -TargetVmName given, so the replacement keeps the source name '{0}'." -f $TargetVmName)
+    }
+
+    # This script creates disks, NICs and a VM. When it fails part way, the inventory of what
+    # it already made is the most valuable thing on screen - so put it in a file too.
+    if (-not $PreflightOnly) {
+        $transcriptDirectory = Split-Path -Path (Resolve-Path -LiteralPath $ManifestPath).ProviderPath -Parent
+        $script:TranscriptPath = Start-RunTranscript -Path (Join-Path -Path $transcriptDirectory -ChildPath ("restore-{0}-{1}.log" -f $TargetVmName, (New-BatchTimestamp)))
+    }
 
     # Which sections did the capture actually get, and which will this run try to replay?
     # Both the extra module requirements and the honesty of the final report depend on it.
@@ -1823,7 +1860,11 @@ try {
     $null = Get-AzResourceGroup -Name $effectiveResourceGroupName -ErrorAction Stop
 
     if (Get-AzVM -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName -ErrorAction SilentlyContinue) {
-        throw ("A VM named '{0}' already exists in resource group '{1}'." -f $TargetVmName, $effectiveResourceGroupName)
+        if ($TargetVmName -eq $manifest.SourceVm.Name -and $effectiveResourceGroupName -eq $manifest.SourceVm.ResourceGroupName) {
+            throw ("The source VM '{0}' still exists in resource group '{1}', so the replacement cannot take the same name there. A VM name only has to be unique WITHIN a resource group, so you have two choices: build the replacement in a different resource group with -TargetResourceGroupName (the source VM stays as your rollback, but Azure Backup history does not follow), or delete the source VM first so the name is free in its own resource group (backup history reattaches, but the source VM is gone and its retained disks plus your snapshots become the rollback)." -f $TargetVmName, $effectiveResourceGroupName)
+        }
+
+        throw ("A VM named '{0}' already exists in resource group '{1}'. Choose a different -TargetVmName or -TargetResourceGroupName." -f $TargetVmName, $effectiveResourceGroupName)
     }
 
     # ---------------------------------------------------------------- Network plan

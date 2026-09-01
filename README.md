@@ -139,10 +139,67 @@ assignment in the portal is not evidence that patching works.
 
 ---
 
+## Choosing the replacement's name
+
+The replacement keeps the source VM's name by default — omit `-TargetVmName` and it is
+inherited from the manifest.
+
+The guest's own hostname, SIDs and domain membership travel on the OS disk and are preserved
+no matter what you call the Azure resource. What the *Azure* resource name controls is
+different, and it is worth being precise about, because a VM's ARM resource ID is:
+
+```
+/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/{name}
+```
+
+The name is only one third of that. The resource group and subscription are equally part of
+the identity — which is why keeping the name alone does **not** keep the identity.
+
+A VM name only has to be unique **within a resource group**, so there are two ways to keep it:
+
+| | Same name, **different** resource group | Same name, **same** resource group |
+|---|---|---|
+| Source VM during cutover | Stays, deallocated, as a rollback | Must be **deleted** first |
+| ARM resource ID | Changes | **Identical** |
+| Azure Backup history | **Orphaned** — new item, fresh full backup | **Reattaches** — chain continues |
+| Alerts, RBAC, policy, automation scoped to the VM | Must be re-pointed | Keep working |
+| Rollback | Start the original VM again | Retained disks + your snapshots |
+| Blast radius if it goes wrong | Low | Higher |
+
+**Which to pick.** If Azure Backup history and resource-ID continuity matter, use the same
+resource group and accept that the source VM has to go. Microsoft's documented remedy for the
+`BCMV2VMNotFound` backup error is exactly that: *"Re-create the virtual machine with the same
+name and same resource group."* Deleting the VM does not delete its disks as long as
+`deleteOption` is `Detach` — **check this, do not assume it**, because the portal's create
+flow defaults the OS disk to *Delete with VM*.
+
+If keeping a bootable rollback matters more, use a different resource group and plan to
+re-point whatever was scoped to the old resource ID. Be aware the VM then lives in that
+resource group permanently, so pick one you are happy to keep — not a scratch "migration" one.
+
+Either way the preflight report tells you, in plain terms, which of the three cases your
+combination lands in and exactly what it does and does not preserve. Read it before you
+proceed.
+
+**Two practical notes for the same-name path:**
+
+- While both VMs exist they share a name. That is legal, but it makes the portal, your
+  scripts and Resource Graph queries ambiguous, so always qualify by resource group. It is
+  also the sharpest reason they must never run at once: they would contend for the same
+  Active Directory computer account and the same private DNS record.
+- `compare-vm-fidelity.ps1` defaults its target resource group to the source's. With the same
+  name that would resolve straight back to the source VM, so pass
+  `-TargetResourceGroupName` explicitly. The script detects the case and refuses rather than
+  reporting a flawless migration that never happened.
+
+---
+
 ## The cutover runbook
 
-Side-by-side: the replacement is built under a **new name** while the original stays intact
-as the rollback. The original's IP is handed over so nothing downstream has to be re-pointed.
+Side-by-side: the replacement is built while the original stays intact as the rollback, and
+the original's IP is handed over so nothing downstream has to be re-pointed. The replacement
+keeps the source VM's name, which means it needs a different resource group - see
+"Choosing the replacement's name" above for what that costs and what the alternative is.
 
 **The rule that governs every step: the two VMs must never be running at the same time.**
 They share a hostname, an Active Directory computer account, SQL Server's `@@SERVERNAME`,
@@ -216,7 +273,7 @@ Add `-DetachPublicIp` if you also need the public IP moved.
 ```powershell
 .\new-vm-from-snapshot-manifest.ps1 `
     -ManifestPath .\SQLPROD01-snapshot-manifest-<stamp>.json `
-    -TargetVmName SQLPROD01-ds -TargetVmSize Standard_E8ds_v5 `
+    -TargetResourceGroupName rg-sqlprod-v2 -TargetVmSize Standard_E8ds_v5 `
     -RestoreMode ImageFirstSwap -UseSourcePrivateIp -PreflightOnly
 ```
 
@@ -234,7 +291,7 @@ Resolve every **BLOCKER**. Read every **WARNING**.
 ```powershell
 .\new-vm-from-snapshot-manifest.ps1 `
     -ManifestPath .\SQLPROD01-snapshot-manifest-<stamp>.json `
-    -TargetVmName SQLPROD01-ds -TargetVmSize Standard_E8ds_v5 `
+    -TargetResourceGroupName rg-sqlprod-v2 -TargetVmSize Standard_E8ds_v5 `
     -RestoreMode ImageFirstSwap -UseSourcePrivateIp
 ```
 
@@ -267,7 +324,7 @@ Start it only once the source is confirmed deallocated. Then, in the guest:
 
 ```powershell
 .\compare-vm-fidelity.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-<stamp>.json `
-    -TargetVmName SQLPROD01-ds -OutputPath .\fidelity-report.json
+    -TargetVmName SQLPROD01 -TargetResourceGroupName rg-sqlprod-v2 -OutputPath .\fidelity-report.json
 ```
 
 Diffs the replacement against the manifest property by property and writes JSON + CSV for

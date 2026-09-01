@@ -27,7 +27,9 @@
     The replacement VM to inspect.
 
 .PARAMETER TargetResourceGroupName
-    Resource group of the replacement VM. Defaults to the source resource group.
+    Resource group of the replacement VM. Defaults to the source resource group - which is
+    wrong whenever the replacement keeps the source name, so pass it explicitly in that case.
+    The script detects and refuses a comparison of the source VM against itself.
 
 .PARAMETER TargetSubscriptionId
     Subscription of the replacement VM. Defaults to the source subscription.
@@ -39,12 +41,12 @@
     Show matching rows too. By default only the rows that need attention are printed.
 
 .EXAMPLE
-    .\compare-vm-fidelity.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-20260901-101500.json -TargetVmName SQLPROD01-ds
+    .\compare-vm-fidelity.ps1 -ManifestPath .\SQLPROD01-snapshot-manifest-20260901-101500.json -TargetVmName SQLPROD01 -TargetResourceGroupName rg-sqlprod-v2
 
     Prints every difference between the source VM as captured and the replacement as built.
 
 .EXAMPLE
-    .\compare-vm-fidelity.ps1 -ManifestPath .\m.json -TargetVmName SQLPROD01-ds -IncludeMatches -OutputPath .\fidelity.json
+    .\compare-vm-fidelity.ps1 -ManifestPath .\m.json -TargetVmName SQLPROD01 -TargetResourceGroupName rg-sqlprod-v2 -IncludeMatches -OutputPath .\fidelity.json
 
     Full report including matches, saved as JSON and CSV for a change record.
 
@@ -174,6 +176,13 @@ try {
 
     $null = Set-AzSubscriptionContext -SubscriptionId $TargetSubscriptionId
     $target = Get-AzVM -ResourceGroupName $TargetResourceGroupName -Name $TargetVmName -ErrorAction Stop
+
+    # When the replacement deliberately keeps the source name, defaulting the resource group
+    # to the source's resolves straight back to the SOURCE VM - and every row would then
+    # match perfectly and report a flawless migration that never happened.
+    if ($target.Id -eq $sourceVm.Id) {
+        throw ("'{0}' in resource group '{1}' IS the source VM recorded in the manifest, so there is nothing to compare. The replacement keeps the source name, so pass -TargetResourceGroupName (and -TargetSubscriptionId if it differs) to point at the replacement." -f $TargetVmName, $TargetResourceGroupName)
+    }
     Write-Ok ("Comparing '{0}' (captured {1}) against '{2}'." -f $sourceVm.Name, $manifest.GeneratedAtUtc, $TargetVmName)
 
     # ------------------------------------------------------------------ Safety
