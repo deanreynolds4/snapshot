@@ -186,9 +186,17 @@ function Select-ParkingAddress {
     }
 
     $probe = Test-AzPrivateIPAddressAvailability -VirtualNetwork $VirtualNetwork -IPAddress $CurrentAddress -ErrorAction Stop
-    $candidates = @(ConvertTo-StringArray -InputObject $probe.AvailableIPAddresses | Where-Object { $_ -ne $CurrentAddress })
+    $available = ConvertTo-StringArray -InputObject $probe.AvailableIPAddresses
+    $candidates = @($available | Where-Object { $_ -ne $CurrentAddress })
     if ($candidates.Count -eq 0) {
         throw ("No free private IP address could be found in virtual network '{0}' to park the source NIC on. Supply one with -ParkingPrivateIpAddress." -f $VirtualNetwork.Name)
+    }
+
+    # Guard against the array-of-array shape that a comma-wrapped return would produce.
+    # Assigning that to a string property silently space-joins every candidate into one
+    # garbage value, and the failure only shows up later at Set-AzNetworkInterface.
+    if ($candidates[0] -isnot [string]) {
+        throw 'Internal error: the parking address candidate list is not a flat list of strings.'
     }
 
     return $candidates[0]
@@ -246,7 +254,7 @@ try {
             $ipConfiguration.PrivateIpAllocationMethod = $handover.OriginalPrivateIpAllocationMethod
 
             if ($handover.PublicIpDetached -and $handover.OriginalPublicIpAddressId) {
-                $publicIp = Get-AzPublicIpAddress -ResourceId $handover.OriginalPublicIpAddressId -ErrorAction Stop
+                $publicIp = Get-AzPublicIpAddress -Name (Get-ResourceNameFromResourceId -ResourceId $handover.OriginalPublicIpAddressId) -ResourceGroupName (Get-ResourceGroupNameFromResourceId -ResourceId $handover.OriginalPublicIpAddressId) -ErrorAction Stop
                 $ipConfiguration.PublicIpAddress = $publicIp
             }
 
@@ -284,12 +292,20 @@ try {
 
     if ($powerState -ne 'PowerState/deallocated') {
         if ($DeallocateVm) {
-            if ($PSCmdlet.ShouldProcess($sourceVmName, 'Deallocate the source VM before releasing its address')) {
-                Write-Detail 'Deallocating the source VM.'
-                $null = Stop-AzVM -ResourceGroupName $sourceResourceGroupName -Name $sourceVmName -Force -ErrorAction Stop
-                $powerState = Get-VmPowerState -ResourceGroupName $sourceResourceGroupName -Name $sourceVmName
-                Write-Ok ("Source VM is now {0}." -f $powerState)
+            if (-not $PSCmdlet.ShouldProcess($sourceVmName, 'Deallocate the source VM before releasing its address')) {
+                # Falling through here would release the address of a VM that is still
+                # running, which is the exact condition this script exists to prevent.
+                throw 'Deallocation was declined, so the address was not released. Deallocate the source VM yourself and rerun.'
             }
+
+            Write-Detail 'Deallocating the source VM.'
+            $null = Stop-AzVM -ResourceGroupName $sourceResourceGroupName -Name $sourceVmName -Force -ErrorAction Stop
+            $powerState = Get-VmPowerState -ResourceGroupName $sourceResourceGroupName -Name $sourceVmName
+            if ($powerState -ne 'PowerState/deallocated') {
+                throw ("Stop-AzVM returned but the source VM reports '{0}' rather than deallocated. Not releasing its address." -f $powerState)
+            }
+
+            Write-Ok ("Source VM is now {0}." -f $powerState)
         }
         elseif (-not $Force) {
             throw ("The source VM reports '{0}'. Releasing its address while it is running would let the replacement VM come up with the same hostname, AD computer account and SQL instance while the original is still live. Deallocate it first, pass -DeallocateVm, or override with -Force if you are certain." -f $powerState)
@@ -398,7 +414,7 @@ try {
     }
 
     if ($DetachPublicIp -and $originalPublicIpId) {
-        $publicIp = Get-AzPublicIpAddress -ResourceId $originalPublicIpId -ErrorAction Stop
+        $publicIp = Get-AzPublicIpAddress -Name (Get-ResourceNameFromResourceId -ResourceId $originalPublicIpId) -ResourceGroupName (Get-ResourceGroupNameFromResourceId -ResourceId $originalPublicIpId) -ErrorAction Stop
         if ($publicIp.IpConfiguration) {
             Write-Warning 'The public IP still reports an IP configuration association. Verify it before attaching it to the replacement VM.'
         }

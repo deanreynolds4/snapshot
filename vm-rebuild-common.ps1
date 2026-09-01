@@ -332,6 +332,11 @@ function ConvertTo-PlainHashtable {
             $items += , (ConvertTo-PlainHashtable -InputObject $item)
         }
 
+        # The comma IS correct here, unlike in ConvertTo-StringArray. This function recurses
+        # and its result is only ever bare-assigned ($result[$key] = ConvertTo-PlainHashtable
+        # ...), never piped or wrapped in @(). Without the comma a nested array would be
+        # flattened into the parent's output and the structure would be lost. Do not "fix"
+        # this to match ConvertTo-StringArray - the two have opposite requirements.
         return , $items
     }
 
@@ -345,6 +350,33 @@ function ConvertTo-PlainHashtable {
     }
 
     return $InputObject
+}
+
+function Get-SafeArray {
+    <#
+    .SYNOPSIS
+        Normalises a possibly-null value into an array, treating $null as EMPTY.
+
+    .DESCRIPTION
+        "@($null).Count" is 1 in PowerShell, not 0, so the common idiom "@($section.Data).Count"
+        reports one item for a section that holds nothing. That turns "no extensions were
+        captured" into "1 extension" in every count and summary that uses it.
+    #>
+    param(
+        [AllowNull()]
+        [object]$InputObject
+    )
+
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -ne $InputObject) {
+        foreach ($item in @($InputObject)) {
+            if ($null -ne $item) {
+                $list.Add($item)
+            }
+        }
+    }
+
+    return $list.ToArray()
 }
 
 function ConvertTo-StringArray {
@@ -363,25 +395,30 @@ function ConvertTo-StringArray {
         [object]$InputObject
     )
 
-    if ($null -eq $InputObject) {
-        return @()
+    $values = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($null -ne $InputObject) {
+        foreach ($item in @($InputObject)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $text = [string]$item
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                continue
+            }
+
+            $values.Add($text)
+        }
     }
 
-    $values = @()
-    foreach ($item in @($InputObject)) {
-        if ($null -eq $item) {
-            continue
-        }
-
-        $text = [string]$item
-        if ([string]::IsNullOrWhiteSpace($text)) {
-            continue
-        }
-
-        $values += $text
-    }
-
-    return , $values
+    # Returns a typed string[], NOT the ", $array" comma-wrap idiom. That idiom protects a
+    # single-element array from unrolling on return, but it does so by emitting the array as
+    # one pipeline object - so "@(ConvertTo-StringArray ...)" yields a one-element array
+    # holding an array, and "ConvertTo-StringArray ... | Where-Object" hands the filter the
+    # whole array as a single item and silently filters nothing. Verified on 5.1. A typed
+    # string[] behaves correctly under bare assignment, @() and piping alike.
+    return $values.ToArray()
 }
 
 #endregion
@@ -415,19 +452,28 @@ function Write-JsonFile {
         $null = New-Item -Path $directory -ItemType Directory -Force
     }
 
+    # [System.IO.File] resolves a relative path against the .NET process working directory,
+    # which is NOT PowerShell's current location and is usually wherever the host started.
+    # Anchor the path to PowerShell's location so a relative -Path lands where the operator
+    # expects rather than somewhere they will never find it.
+    $fullPath = $Path
+    if (-not [System.IO.Path]::IsPathRooted($fullPath)) {
+        $fullPath = Join-Path -Path (Get-Location).ProviderPath -ChildPath $Path
+    }
+
     $json = $InputObject | ConvertTo-Json -Depth $Depth
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $json, $encoding)
+    [System.IO.File]::WriteAllText($fullPath, $json, $encoding)
 
     # Round-trip validation: prove the file we just wrote can be read back.
     try {
-        $null = Read-JsonFile -Path $Path
+        $null = Read-JsonFile -Path $fullPath
     }
     catch {
-        throw ("Wrote '{0}' but it could not be parsed back: {1}" -f $Path, $_.Exception.Message)
+        throw ("Wrote '{0}' but it could not be parsed back: {1}" -f $fullPath, $_.Exception.Message)
     }
 
-    return $Path
+    return $fullPath
 }
 
 function Read-JsonFile {
@@ -449,7 +495,11 @@ function Read-JsonFile {
         throw ("File '{0}' does not exist." -f $Path)
     }
 
-    $raw = Get-Content -LiteralPath $Path -Raw
+    # Read as UTF-8 explicitly. Write-JsonFile writes UTF-8 with no BOM, and on Windows
+    # PowerShell 5.1 "Get-Content -Raw" with no -Encoding decodes a BOM-less file using the
+    # system ANSI codepage - which silently mojibakes any non-ASCII tag value, resource name
+    # or note, with no error at all. ConvertFrom-Json parses the corrupted text happily.
+    $raw = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).ProviderPath, [System.Text.Encoding]::UTF8)
     if ([string]::IsNullOrWhiteSpace($raw)) {
         throw ("File '{0}' is empty." -f $Path)
     }

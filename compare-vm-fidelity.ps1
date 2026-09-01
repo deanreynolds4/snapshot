@@ -192,14 +192,22 @@ try {
     Write-Detail ("Target '{0}': {1}" -f $TargetVmName, $targetPowerState)
 
     $bothRunning = ($sourcePowerState -eq 'PowerState/running') -and ($targetPowerState -eq 'PowerState/running')
-    if ($bothRunning) {
+    $stateUnknown = ($sourcePowerState -eq 'PowerState/unknown') -or ($targetPowerState -eq 'PowerState/unknown')
+
+    if ($stateUnknown -and -not $bothRunning) {
+        # Reporting "only one VM is running" when a power state could not be read would be
+        # a false all-clear on the single most dangerous condition in the cutover.
+        Add-ComparisonRow -Category 'Safety' -Setting 'Concurrent power state' -Source $sourcePowerState -Target $targetPowerState -Status 'Unknown' `
+            -Note 'A power state could not be read, so it is NOT confirmed that only one VM is running. Check both by hand.'
+    }
+    elseif ($bothRunning) {
         Add-ComparisonRow -Category 'Safety' -Setting 'Concurrent power state' -Source $sourcePowerState -Target $targetPowerState -Status 'DIFFERS' `
             -Note 'BOTH VMs ARE RUNNING. They share a hostname, an Active Directory computer account and a SQL Server instance identity. Shut one down now.'
         Write-Host ''
         Write-Host 'CRITICAL: both the source and the replacement VM are running at the same time.' -ForegroundColor Red
     }
     else {
-        Add-ComparisonRow -Category 'Safety' -Setting 'Concurrent power state' -Source $sourcePowerState -Target $targetPowerState -Status 'Match' -Note 'Only one VM is running.'
+        Add-ComparisonRow -Category 'Safety' -Setting 'Concurrent power state' -Source $sourcePowerState -Target $targetPowerState -Status 'Match' -Note 'Confirmed: the two VMs are not both running.'
     }
 
     # ------------------------------------------------------------------ Placement and identity
@@ -502,6 +510,19 @@ try {
 
         Compare-Value -Category 'Update Manager' -Setting 'Maintenance assignments' -Source @($maintenanceSection.Data).Count -Target $targetAssignments.Count `
             -Note 'An assignment existing is not proof that patching works: it can be attached to a VM that lacks the patch prerequisite and then fail at run time.'
+    }
+
+    # ------------------------------------------------------------------ Capture coverage
+    # A section that failed or was skipped at capture time was never compared at all. Left
+    # silent, its absence from this report reads as a clean bill of health.
+    foreach ($sectionName in @('Extensions', 'BackupProtection', 'MaintenanceAssignments', 'SqlVirtualMachine', 'DataCollectionRuleAssociations', 'RoleAssignments', 'ResourceLocks', 'SqlWorkloadBackup')) {
+        $section = Get-ObjectPropertyValue -InputObject $manifest -PropertyNames @($sectionName)
+        $status = Get-ObjectPropertyValue -InputObject $section -PropertyNames @('Status') -Default 'Absent'
+
+        if ($status -eq 'Failed' -or $status -eq 'Skipped') {
+            Add-ComparisonRow -Category 'Capture coverage' -Setting $sectionName -Source ('capture ' + $status.ToLower()) -Target 'not compared' -Status 'Unknown' `
+                -Note ("This section was never captured ({0}), so nothing here has been verified. Check it by hand." -f (Get-ObjectPropertyValue -InputObject $section -PropertyNames @('Reason') -Default 'no reason recorded'))
+        }
     }
 
     # ------------------------------------------------------------------ Report

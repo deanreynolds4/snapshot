@@ -106,7 +106,9 @@
     It never deletes anything.
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+# ConfirmImpact High: -DeallocateVm shuts down a production VM, which must never happen on
+# a bare invocation without an explicit confirmation.
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
@@ -858,15 +860,24 @@ function Get-VmExtensionDetail {
 
     $result = @()
     foreach ($extension in $extensions) {
-        $hasProtectedSettings = $false
-        if (Test-ObjectHasProperty -InputObject $extension -PropertyName 'ProtectedSettings') {
-            $hasProtectedSettings = ($null -ne $extension.ProtectedSettings)
-        }
+        # Azure NEVER returns protectedSettings - it is write-only and comes back scrubbed -
+        # so testing the property always says "no secrets" and the restore would happily
+        # re-add a Custom Script extension without its storage key or a domain join without
+        # its password. Decide from the extension type instead.
+        $secretBearingTypes = @(
+            'CustomScriptExtension', 'CustomScript', 'JsonADDomainExtension', 'IaaSAntimalware',
+            'KeyVaultForWindows', 'KeyVaultForLinux', 'HybridWorkerExtension',
+            'AzureDiskEncryption', 'AzureDiskEncryptionForLinux', 'VMAccessAgent', 'VMAccessForLinux',
+            'DSC', 'DSCForLinux', 'MicrosoftMonitoringAgent', 'OmsAgentForLinux'
+        )
+
+        $extensionTypeName = '' + (Get-ObjectPropertyValue -InputObject $extension -PropertyNames @('ExtensionType', 'Type'))
+        $hasProtectedSettings = ($secretBearingTypes -contains $extensionTypeName)
 
         $result += [pscustomobject]@{
             Name                    = $extension.Name
             Publisher               = $extension.Publisher
-            ExtensionType           = (Get-ObjectPropertyValue -InputObject $extension -PropertyNames @('ExtensionType', 'ExtensionHandlerVersion', 'Type'))
+            ExtensionType           = (Get-ObjectPropertyValue -InputObject $extension -PropertyNames @('ExtensionType', 'Type'))
             TypeHandlerVersion      = $extension.TypeHandlerVersion
             AutoUpgradeMinorVersion = (Get-BooleanPropertyValue -InputObject $extension -PropertyNames @('AutoUpgradeMinorVersion'))
             EnableAutomaticUpgrade  = (Get-BooleanPropertyValue -InputObject $extension -PropertyNames @('EnableAutomaticUpgrade'))
@@ -1110,6 +1121,8 @@ try {
 
     Write-Step 'Checking prerequisites'
     Assert-AzModule -Name @('Az.Accounts', 'Az.Compute', 'Az.Network')
+    # Az.Resources is probed rather than required: it is only needed for the role assignment
+    # and resource lock sections, which degrade to a recorded 'Skipped' status without it.
     $originalContext = Save-AzContextState
     $null = Connect-AzIfNeeded -SubscriptionId $SubscriptionId
 
@@ -1287,7 +1300,12 @@ try {
     $powerState = Get-VmPowerState -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name
     Write-Detail ("Power state: {0}" -f $powerState)
 
-    if ($ConsistencyMode -eq 'Deallocated' -and $powerState -ne 'PowerState/deallocated') {
+    if ($SkipSnapshots) {
+        # Inventory-only run. No snapshot is taken, so consistency is irrelevant and the VM
+        # is left alone - this is the rehearsal pass the runbook opens with.
+        Write-Detail 'Inventory only (-SkipSnapshots): the consistency precondition does not apply and the VM will not be touched.'
+    }
+    elseif ($ConsistencyMode -eq 'Deallocated' -and $powerState -ne 'PowerState/deallocated') {
         if ($DeallocateVm) {
             if ($PSCmdlet.ShouldProcess($vm.Name, 'Deallocate the source VM so its disks can be snapshotted consistently')) {
                 Write-Detail 'Deallocating the source VM. This stops the workload.'
@@ -1308,7 +1326,7 @@ try {
         }
     }
 
-    if ($ConsistencyMode -eq 'LiveUnsafe') {
+    if ($ConsistencyMode -eq 'LiveUnsafe' -and -not $SkipSnapshots) {
         Add-FidelityGap 'Snapshots were taken per-disk on a RUNNING VM. The disks do not share a point in time and the set is not guaranteed to be recoverable. Do not cut over to it.'
         if (-not $PSCmdlet.ShouldProcess($vm.Name, 'Take per-disk snapshots of a RUNNING VM, producing a set that is NOT guaranteed to be recoverable')) {
             throw 'Live unsafe capture declined.'
@@ -1349,11 +1367,14 @@ try {
         $useIncremental = -not $FullSnapshot.IsPresent
         Write-Detail ("{0} snapshots, SKU {1}, into resource group '{2}'." -f $(if ($useIncremental) { 'Incremental' } else { 'Full' }), $SnapshotSkuName, $SnapshotResourceGroupName)
 
-        foreach ($entry in $plan) {
-            if (-not $PSCmdlet.ShouldProcess($entry.SnapshotName, 'Create disk snapshot')) {
-                throw 'Snapshot creation declined; aborting so a partial set is not left behind.'
-            }
+        # Confirm ONCE for the whole batch. Prompting per snapshot means declining the third
+        # of six leaves two orphaned snapshots and no manifest, which is the worst outcome.
+        $planSummary = ($plan | ForEach-Object { $_.SnapshotName }) -join ', '
+        if (-not $PSCmdlet.ShouldProcess($planSummary, ("Create {0} disk snapshot(s)" -f $plan.Count))) {
+            throw 'Snapshot creation declined. Nothing was created.'
+        }
 
+        foreach ($entry in $plan) {
             $created = New-DiskSnapshot -Disk $entry.Disk -SnapshotName $entry.SnapshotName -SnapshotResourceGroupName $SnapshotResourceGroupName -Location $vm.Location -SkuName $SnapshotSkuName -Incremental $useIncremental -Tag $snapshotTags
             $snapshotEntries += $created
             Write-Ok ("{0}" -f $created.SnapshotName)
@@ -1378,8 +1399,10 @@ try {
             BatchTimestamp     = $batchTimestamp
             ConsistencyMode    = $ConsistencyMode
             PowerStateAtCapture = $powerState
-            IsConsistent       = ($ConsistencyMode -eq 'Deallocated' -and $powerState -eq 'PowerState/deallocated') -or ($ConsistencyMode -eq 'RestorePoint')
-            SnapshotsCreated   = (-not $SkipSnapshots.IsPresent)
+            # Recorded from what actually happened, not from what was requested: -WhatIf or a
+            # declined confirmation must not leave a manifest claiming snapshots exist.
+            IsConsistent       = (($ConsistencyMode -eq 'Deallocated' -and $powerState -eq 'PowerState/deallocated') -or ($ConsistencyMode -eq 'RestorePoint')) -and ($snapshotEntries.Count -gt 0)
+            SnapshotsCreated   = ($snapshotEntries.Count -gt 0)
             IncrementalSnapshots = (-not $FullSnapshot.IsPresent)
             SnapshotSkuName    = $SnapshotSkuName
             RestorePointCollectionName = (Get-ObjectPropertyValue -InputObject $restorePointInfo -PropertyNames @('RestorePointCollectionName'))

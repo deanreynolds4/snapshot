@@ -213,6 +213,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:ManualChecklist = [System.Collections.Generic.List[string]]::new()
 $script:CreatedResources = [System.Collections.Generic.List[object]]::new()
+$script:TranscriptPath = $null
 
 function Add-ManualChecklistItem {
     param(
@@ -569,7 +570,7 @@ function New-RestoredNetworkInterface {
         $asgObjects = @()
         foreach ($asgId in $asgIds) {
             try {
-                $asgObjects += Get-AzApplicationSecurityGroup -ResourceId $asgId -ErrorAction Stop
+                $asgObjects += Get-AzApplicationSecurityGroup -Name (Get-ResourceNameFromResourceId -ResourceId $asgId) -ResourceGroupName (Get-ResourceGroupNameFromResourceId -ResourceId $asgId) -ErrorAction Stop
             }
             catch {
                 Write-Warning ("Unable to resolve application security group '{0}'. {1}" -f $asgId, $_.Exception.Message)
@@ -1095,7 +1096,14 @@ function New-PlaceholderVmFromImage {
 
     $sourceVm = $Manifest.SourceVm
     $image = Get-ObjectPropertyValue -InputObject $sourceVm -PropertyNames @('ImageReference')
-    if (-not $image -or [string]::IsNullOrWhiteSpace('' + $image.Publisher)) {
+    $imageId = $null
+    if ($image) {
+        # A gallery-sourced VM has no publisher/offer/sku, only an image ID - and the code
+        # below handles that perfectly well, so the guard must not reject it.
+        $imageId = Get-ObjectPropertyValue -InputObject $image -PropertyNames @('Id', 'SharedGalleryImageId', 'CommunityGalleryImageId')
+    }
+
+    if (-not $image -or ([string]::IsNullOrWhiteSpace('' + $image.Publisher) -and [string]::IsNullOrWhiteSpace('' + $imageId))) {
         throw 'ImageFirstSwap needs the original image reference of the source VM, and the manifest does not have one. That normally means the source VM was itself built from a specialized disk, so it has no image provenance to reproduce. Use -RestoreMode AttachOsDisk and accept that scheduled patching cannot be re-established.'
     }
 
@@ -1134,8 +1142,13 @@ function New-PlaceholderVmFromImage {
             $null = Add-SupportedParameter -Splat $osParameters -CmdletName 'Set-AzVMOperatingSystem' -ParameterName 'ProvisionVMAgent' -Value ([bool]$windowsConfiguration.ProvisionVMAgent) -AllowFalse
 
             if ($windowsConfiguration.PatchSettings -and $windowsConfiguration.PatchSettings.PatchMode) {
-                $null = Add-SupportedParameter -Splat $osParameters -CmdletName 'Set-AzVMOperatingSystem' -ParameterName 'PatchMode' -Value $windowsConfiguration.PatchSettings.PatchMode
-                $null = Add-SupportedParameter -Splat $osParameters -CmdletName 'Set-AzVMOperatingSystem' -ParameterName 'AssessmentMode' -Value $windowsConfiguration.PatchSettings.AssessmentMode
+                $patch = $windowsConfiguration.PatchSettings
+                $null = Add-SupportedParameter -Splat $osParameters -CmdletName 'Set-AzVMOperatingSystem' -ParameterName 'PatchMode' -Value $patch.PatchMode
+                $null = Add-SupportedParameter -Splat $osParameters -CmdletName 'Set-AzVMOperatingSystem' -ParameterName 'AssessmentMode' -Value $patch.AssessmentMode
+
+                if (Get-BooleanPropertyValue -InputObject $patch -PropertyNames @('EnableHotpatching')) {
+                    $null = Add-SupportedParameter -Splat $osParameters -CmdletName 'Set-AzVMOperatingSystem' -ParameterName 'EnableHotpatching' -Value $true
+                }
             }
         }
     }
@@ -1143,21 +1156,37 @@ function New-PlaceholderVmFromImage {
     $vmConfig = Set-AzVMOperatingSystem @osParameters
 
     $sourceImageParameters = @{ VM = $vmConfig }
-    if ($image.Id) {
-        $sourceImageParameters.Id = $image.Id
+    if ($imageId) {
+        $sourceImageParameters.Id = $imageId
     }
     else {
         $sourceImageParameters.PublisherName = $image.Publisher
         $sourceImageParameters.Offer         = $image.Offer
         $sourceImageParameters.Skus          = $image.Sku
-        if ($image.Version) { $sourceImageParameters.Version = $image.Version } else { $sourceImageParameters.Version = 'latest' }
+
+        # Prefer the exact version the source VM was actually running. A VM created with
+        # Version='latest' records the resolved build in ExactVersion, and using it keeps the
+        # placeholder's osProfile defaults aligned with the guest on the restored disk
+        # instead of with whatever Microsoft published since.
+        $imageVersion = Get-ObjectPropertyValue -InputObject $image -PropertyNames @('ExactVersion')
+        if ([string]::IsNullOrWhiteSpace('' + $imageVersion) -or ('' + $imageVersion) -eq 'latest') {
+            $imageVersion = Get-ObjectPropertyValue -InputObject $image -PropertyNames @('Version') -Default 'latest'
+        }
+
+        $sourceImageParameters.Version = $imageVersion
+        Write-Detail ("Placeholder image version: {0}" -f $imageVersion)
     }
 
     $vmConfig = Set-AzVMSourceImage @sourceImageParameters
 
     # The swap requires both OS disks to be the same size, so the placeholder disk is created
     # at the restored disk's size rather than at the image default.
-    $vmConfig = Set-AzVMOSDisk -VM $vmConfig -Name ("{0}-placeholder-osdisk" -f $ConfigParameters.VMName) -CreateOption FromImage -DiskSizeInGB $OsDiskSizeGB -StorageAccountType $OsDiskStorageAccountType
+    $placeholderDiskName = New-AzureResourceName -Prefix $ConfigParameters.VMName -Discriminator 'placeholder' -Suffix 'osdisk' -MaxLength $script:AzureDiskNameMaxLength
+    if (Get-AzDisk -ResourceGroupName $ResourceGroupName -DiskName $placeholderDiskName -ErrorAction SilentlyContinue) {
+        throw ("A disk named '{0}' already exists in resource group '{1}'; the placeholder cannot be created. Remove it, or use a different -TargetVmName." -f $placeholderDiskName, $ResourceGroupName)
+    }
+
+    $vmConfig = Set-AzVMOSDisk -VM $vmConfig -Name $placeholderDiskName -CreateOption FromImage -DiskSizeInGB $OsDiskSizeGB -StorageAccountType $OsDiskStorageAccountType
 
     $planInfo = Get-ObjectPropertyValue -InputObject $sourceVm -PropertyNames @('Plan')
     if ($planInfo -and $planInfo.Name) {
@@ -1180,6 +1209,144 @@ function New-PlaceholderVmFromImage {
     return $placeholder
 }
 
+function New-TemporaryPlaceholderNic {
+    <#
+    .SYNOPSIS
+        Creates a throwaway NIC for the placeholder VM to boot on.
+
+    .DESCRIPTION
+        Creating a VM always starts it - Azure has no "create stopped" option - so the
+        ImageFirstSwap placeholder boots a blank Windows install from the platform image
+        before its disk is swapped. Booting that on the PRODUCTION NIC would give a stranger
+        machine the production private IP, its NSG rules and, if the NIC is in a load
+        balancer backend pool, live traffic answering health probes.
+
+        So the placeholder gets its own NIC with a dynamic address instead. It keeps the
+        production subnet and NSG, so it is no more exposed than the subnet already allows,
+        and it is deleted once the real NIC has been swapped in.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NicName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceGroupName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Location,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SubnetId,
+
+        [string]$NetworkSecurityGroupId
+    )
+
+    $parameters = @{
+        Name                = $NicName
+        ResourceGroupName   = $ResourceGroupName
+        Location            = $Location
+        SubnetId            = $SubnetId
+        IpConfigurationName = 'ipconfig1'
+        ErrorAction         = 'Stop'
+    }
+
+    if ($NetworkSecurityGroupId) {
+        $parameters.NetworkSecurityGroupId = $NetworkSecurityGroupId
+    }
+
+    $nic = New-AzNetworkInterface @parameters
+    Register-CreatedResource -Type 'NetworkInterface (temporary)' -Name $nic.Name -Id $nic.Id
+    Write-Detail ("Placeholder will boot on temporary NIC '{0}' ({1}), not on the production NIC." -f $nic.Name, $nic.IpConfigurations[0].PrivateIpAddress)
+    return $nic
+}
+
+function Set-VmPrimaryNetworkInterface {
+    <#
+    .SYNOPSIS
+        Replaces every NIC on a deallocated VM with the supplied one.
+
+    .DESCRIPTION
+        A VM must always have at least one NIC, and its NIC set can only be changed while it
+        is deallocated. Used to move the placeholder off its throwaway NIC and onto the real
+        one once the OS disk has been swapped.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceGroupName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VmName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$NicId
+    )
+
+    $powerState = Get-VmPowerState -ResourceGroupName $ResourceGroupName -Name $VmName
+    if ($powerState -ne 'PowerState/deallocated') {
+        throw ("The VM must be deallocated to change its network interfaces, but it reports '{0}'." -f $powerState)
+    }
+
+    $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -ErrorAction Stop
+    $vm.NetworkProfile.NetworkInterfaces.Clear()
+    $vm = Add-AzVMNetworkInterface -VM $vm -Id $NicId -Primary
+    $null = Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm -ErrorAction Stop
+
+    Write-Ok ("Attached the production NIC '{0}'." -f (Get-ResourceNameFromResourceId -ResourceId $NicId))
+}
+
+function Assert-SourceVmNotRunning {
+    <#
+    .SYNOPSIS
+        Re-reads the source VM's power state and refuses to continue if it is running.
+
+    .DESCRIPTION
+        Called immediately before anything that boots the replacement, rather than relying on
+        the reading taken at preflight - which may be an hour old by then, and which someone
+        may have invalidated by starting the source VM in the meantime.
+
+        A VM cannot be created in a stopped state, so creating the replacement IS booting it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Manifest,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Action,
+
+        [bool]$Force
+    )
+
+    $name = $Manifest.SourceVm.Name
+    $resourceGroupName = $Manifest.SourceVm.ResourceGroupName
+
+    try {
+        $null = Get-AzVM -ResourceGroupName $resourceGroupName -Name $name -ErrorAction Stop
+    }
+    catch {
+        # Distinguish "the VM is gone" from "I could not read it". Only the first is safe.
+        if (('' + $_.Exception.Message) -match '(?i)not\s*found|ResourceNotFound') {
+            Write-Detail ("Source VM '{0}' no longer exists, so both machines cannot run at once." -f $name)
+            return
+        }
+
+        throw ("Could not read the state of source VM '{0}' to confirm it is not running: {1} Refusing to {2}. Rerun once the source VM's state can be read, or pass -Force if you have confirmed by hand that it is shut down." -f $name, $_.Exception.Message, $Action)
+    }
+
+    $powerState = Get-VmPowerState -ResourceGroupName $resourceGroupName -Name $name
+    if ($powerState -eq 'PowerState/deallocated' -or $powerState -eq 'PowerState/stopped') {
+        Write-Detail ("Source VM '{0}' is {1}." -f $name, $powerState)
+        return
+    }
+
+    $message = ("Source VM '{0}' reports '{1}'. {2} now would put two machines online sharing a hostname, an Active Directory computer account and a SQL Server instance identity." -f $name, $powerState, $Action)
+    if ($Force) {
+        Write-Warning ($message + ' Continuing because -Force was supplied.')
+        return
+    }
+
+    throw $message
+}
+
 function Invoke-OsDiskSwap {
     <#
     .SYNOPSIS
@@ -1200,7 +1367,9 @@ function Invoke-OsDiskSwap {
         [string]$VmName,
 
         [Parameter(Mandatory = $true)]
-        [object]$RestoredOsDisk
+        [object]$RestoredOsDisk,
+
+        [string]$Caching
     )
 
     Write-Detail 'Deallocating the placeholder VM so its OS disk can be swapped.'
@@ -1220,7 +1389,20 @@ function Invoke-OsDiskSwap {
     }
 
     Write-Detail ("Swapping in the restored OS disk '{0}'." -f $RestoredOsDisk.Name)
-    $vm = Set-AzVMOSDisk -VM $vm -ManagedDiskId $RestoredOsDisk.Id -Name $RestoredOsDisk.Name -ErrorAction Stop
+    $swapParameters = @{
+        VM            = $vm
+        ManagedDiskId = $RestoredOsDisk.Id
+        Name          = $RestoredOsDisk.Name
+        ErrorAction   = 'Stop'
+    }
+
+    # Without this the swapped disk inherits the placeholder's caching rather than the
+    # source VM's, which for a SQL Server OS disk is a silent behaviour change.
+    if ($Caching) {
+        $swapParameters.Caching = $Caching
+    }
+
+    $vm = Set-AzVMOSDisk @swapParameters
     $null = Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm -ErrorAction Stop
 
     Write-Ok 'OS disk swapped. The VM keeps the osProfile it was created with, including its patch settings.'
@@ -1437,6 +1619,32 @@ function New-PreflightReport {
         }
     }
 
+    # --- ImageFirstSwap preconditions. These have to be blockers at preflight: the mode
+    # only fails once the placeholder VM is being built, by which point the disks have been
+    # restored and the IP has been claimed.
+    if ($Plan.RestoreMode -eq 'ImageFirstSwap') {
+        $image = Get-ObjectPropertyValue -InputObject $sourceVm -PropertyNames @('ImageReference')
+        $hasMarketplaceImage = $image -and -not [string]::IsNullOrWhiteSpace('' + $image.Publisher)
+        $hasGalleryImage = $image -and (-not [string]::IsNullOrWhiteSpace('' + $image.Id) -or
+                                        -not [string]::IsNullOrWhiteSpace('' + $image.SharedGalleryImageId) -or
+                                        -not [string]::IsNullOrWhiteSpace('' + $image.CommunityGalleryImageId))
+
+        if (-not $hasMarketplaceImage -and -not $hasGalleryImage) {
+            $blockers.Add('RestoreMode ImageFirstSwap needs the source VM''s original image reference, and the manifest has none. That normally means the source VM was itself built from a specialized disk. Use -RestoreMode AttachOsDisk and accept that scheduled patching cannot be re-established.')
+        }
+
+        $osDiskRecord = @($Manifest.Disks | Where-Object { $_.DiskRole -eq 'OS' }) | Select-Object -First 1
+        if (-not $osDiskRecord -or -not $osDiskRecord.DiskSizeGB) {
+            $blockers.Add('RestoreMode ImageFirstSwap needs the source OS disk size, so it can build the placeholder disk at a matching size for the swap. The manifest does not record it.')
+        }
+
+        if ($sourceSecurityType -eq 'ConfidentialVM') {
+            $blockers.Add('RestoreMode ImageFirstSwap is not supported for Confidential VMs. Their OS disk is bound to platform-managed confidential state that a swap does not carry.')
+        }
+
+        $warnings.Add('ImageFirstSwap briefly boots a blank Windows install from the platform image before the swap. It is created on a TEMPORARY NIC with a dynamic address - never on the production NIC - so it cannot claim the production IP, join a load balancer pool or answer health probes. The temporary NIC is deleted afterwards.')
+    }
+
     # --- Identity
     $identity = Get-ObjectPropertyValue -InputObject $Manifest -PropertyNames @('Identity')
     if ($identity -and ('' + $identity.Type) -match 'SystemAssigned') {
@@ -1493,7 +1701,7 @@ function New-PreflightReport {
             SecurityType           = $sourceSecurityType
             EncryptionAtHost       = (Get-BooleanPropertyValue -InputObject $sourceVm -PropertyNames @('EncryptionAtHost'))
             Identity               = (Get-ObjectPropertyValue -InputObject $identity -PropertyNames @('Type'))
-            ExtensionCount         = @((Get-ObjectPropertyValue -InputObject $Manifest.Extensions -PropertyNames @('Data'))).Count
+            ExtensionCount         = (Get-SafeArray -InputObject (Get-ObjectPropertyValue -InputObject $Manifest.Extensions -PropertyNames @('Data'))).Count
             BackupStatus           = (Get-ObjectPropertyValue -InputObject $Manifest.BackupProtection -PropertyNames @('Status'))
             MaintenanceStatus      = (Get-ObjectPropertyValue -InputObject $Manifest.MaintenanceAssignments -PropertyNames @('Status'))
             SqlRegistrationStatus  = (Get-ObjectPropertyValue -InputObject $Manifest.SqlVirtualMachine -PropertyNames @('Status'))
@@ -1513,8 +1721,16 @@ function New-PreflightReport {
 $originalContext = $null
 
 try {
+    # This script creates disks, NICs and a VM. When it fails part way, the inventory of what
+    # it already made is the most valuable thing on screen - so put it in a file too.
+    if (-not $PreflightOnly) {
+        $transcriptDirectory = Split-Path -Path (Resolve-Path -LiteralPath $ManifestPath).ProviderPath -Parent
+        $script:TranscriptPath = Start-RunTranscript -Path (Join-Path -Path $transcriptDirectory -ChildPath ("restore-{0}-{1}.log" -f $TargetVmName, (New-BatchTimestamp)))
+    }
+
     Write-Step 'Checking prerequisites'
-    Assert-AzModule -Name @('Az.Accounts', 'Az.Compute', 'Az.Network')
+    # Az.Resources is not optional here: Get-AzResourceGroup is called before anything else.
+    Assert-AzModule -Name @('Az.Accounts', 'Az.Compute', 'Az.Network', 'Az.Resources')
     $originalContext = Save-AzContextState
 
     Write-Step 'Reading manifest'
@@ -1526,10 +1742,59 @@ try {
     }
 
     if (-not $manifest.SourceVm) { throw 'The manifest is missing the SourceVm section.' }
-    if (-not $manifest.Snapshots -or -not $manifest.Snapshots.OsDisk) { throw 'The manifest is missing the OS disk snapshot entry.' }
+
+    # A manifest written with -SkipSnapshots has no disk sources. That is fatal for a real
+    # restore, but it must still run a preflight - the README offers exactly that as the
+    # no-cost rehearsal, and preflight reports it as a blocker with an explanation.
+    if (-not $manifest.Snapshots -or -not $manifest.Snapshots.OsDisk) {
+        if (-not $PreflightOnly) {
+            throw 'The manifest has no OS disk source, so there is nothing to restore from. It was most likely written with -SkipSnapshots; recapture without that switch. (-PreflightOnly still works against it.)'
+        }
+
+        Write-Warning 'This manifest has no disk sources (written with -SkipSnapshots). Running preflight only.'
+    }
 
     Write-Detail ("Source VM: {0} ({1})" -f $manifest.SourceVm.Name, $manifest.SourceVm.VmSize)
     Write-Detail ("Captured : {0} in {1} mode" -f $manifest.GeneratedAtUtc, $manifest.Capture.ConsistencyMode)
+
+    # Which sections did the capture actually get, and which will this run try to replay?
+    # Both the extra module requirements and the honesty of the final report depend on it.
+    $sectionPlan = @(
+        [pscustomobject]@{ Name = 'Extensions';                     Module = $null;                    Skipped = $SkipExtensions.IsPresent }
+        [pscustomobject]@{ Name = 'BackupProtection';               Module = 'Az.RecoveryServices';    Skipped = $SkipBackup.IsPresent }
+        [pscustomobject]@{ Name = 'MaintenanceAssignments';         Module = 'Az.Maintenance';         Skipped = $SkipMaintenance.IsPresent }
+        [pscustomobject]@{ Name = 'SqlVirtualMachine';              Module = 'Az.SqlVirtualMachine';   Skipped = $SkipSqlRegistration.IsPresent }
+        [pscustomobject]@{ Name = 'DataCollectionRuleAssociations'; Module = 'Az.Monitor';             Skipped = $SkipDataCollectionRules.IsPresent }
+    )
+
+    $extraModules = @()
+    foreach ($section in $sectionPlan) {
+        $captured = Get-ObjectPropertyValue -InputObject $manifest -PropertyNames @($section.Name)
+        $status = Get-ObjectPropertyValue -InputObject $captured -PropertyNames @('Status') -Default 'Absent'
+
+        if ($status -eq 'Captured' -and -not $section.Skipped -and $section.Module) {
+            $extraModules += $section.Module
+        }
+
+        # A section the capture could not read, or skipped for a missing module, is NOT
+        # replayed. Saying nothing here is how a dropped setting reaches production
+        # unnoticed, so it goes on the checklist now rather than being discovered later.
+        if ($status -eq 'Failed') {
+            Add-ManualChecklistItem ("Manifest section '{0}' FAILED to capture, so it cannot be replayed. Check that setting on the source VM and apply it by hand." -f $section.Name)
+        }
+        elseif ($status -eq 'Skipped') {
+            Add-ManualChecklistItem ("Manifest section '{0}' was SKIPPED at capture time ({1}), so it was never recorded and cannot be replayed. Check it by hand." -f $section.Name, (Get-ObjectPropertyValue -InputObject $captured -PropertyNames @('Reason') -Default 'reason not recorded'))
+        }
+        elseif ($status -eq 'Captured' -and $section.Skipped) {
+            Add-ManualChecklistItem ("Manifest section '{0}' was captured but its replay was disabled by a -Skip switch on this run." -f $section.Name)
+        }
+    }
+
+    if ($extraModules.Count -gt 0) {
+        # Fail now, with the full list, rather than part-way through the carryover steps
+        # after the VM and its disks already exist.
+        Assert-AzModule -Name ($extraModules | Select-Object -Unique)
+    }
 
     $null = Connect-AzIfNeeded
 
@@ -1636,10 +1901,21 @@ try {
         $sourcePowerState = Get-VmPowerState -ResourceGroupName $sourceVmObject.ResourceGroupName -Name $sourceVmObject.Name
     }
     catch {
-        Write-Detail 'The source VM no longer exists, so there is no risk of both running.'
+        # "Gone" and "I could not read it" are very different answers to "can both run at
+        # once?". Only the first is safe to treat as no risk.
+        if (('' + $_.Exception.Message) -match '(?i)not\s*found|ResourceNotFound') {
+            Write-Detail 'The source VM no longer exists, so both machines cannot run at once.'
+        }
+        else {
+            $sourcePowerState = 'Unreadable'
+            Write-Warning ("Could not read the source VM's state: {0}" -f $_.Exception.Message)
+        }
     }
 
-    if ($sourceStillExists -and $sourcePowerState -ne 'PowerState/deallocated' -and $sourcePowerState -ne 'PowerState/stopped') {
+    if ($sourcePowerState -eq 'Unreadable') {
+        $report.Blockers += ("The source VM '{0}' exists but its power state could not be read, so it cannot be confirmed shut down. Creating the replacement now risks two machines online with the same identity. Resolve the access problem, or pass -Force once you have confirmed by hand that it is off." -f $manifest.SourceVm.Name)
+    }
+    elseif ($sourceStillExists -and $sourcePowerState -ne 'PowerState/deallocated' -and $sourcePowerState -ne 'PowerState/stopped') {
         $message = ("The SOURCE VM '{0}' is currently '{1}'. Creating the replacement now risks both machines running with the same hostname, AD computer account and SQL Server instance. Deallocate the source first." -f $manifest.SourceVm.Name, $sourcePowerState)
         if ($Force) { $report.Warnings += $message }
         else { $report.Blockers += $message }
@@ -1671,7 +1947,9 @@ try {
     }
 
     if ($report.Blockers.Count -gt 0) {
-        throw ("Preflight found {0} blocker(s). Resolve them, or rerun with -Force if you accept the risk." -f $report.Blockers.Count)
+        # -Force only relaxes the source-VM-still-running check. Every other blocker is a
+        # hard incompatibility that no flag can wish away, so do not imply otherwise.
+        throw ("Preflight found {0} blocker(s), listed above. These must be resolved; -Force only relaxes the check that the source VM is shut down, not any of the compatibility blockers." -f $report.Blockers.Count)
     }
 
     if (-not $PSCmdlet.ShouldProcess($TargetVmName, ("Create a replacement VM of size {0} in {1}/{2}" -f $TargetVmSize, $effectiveResourceGroupName, $effectiveLocation))) {
@@ -1816,23 +2094,63 @@ try {
         # Build the VM from the original image first so it gets a real osProfile, then swap
         # the restored disk in underneath it. This is the only route that keeps guest patch
         # settings, because osProfile cannot be added to a VM after creation.
+        #
+        # The placeholder boots - Azure cannot create a VM in a stopped state - so it is
+        # given a THROWAWAY NIC. Booting a blank Windows install on the production NIC would
+        # hand it the production IP, the production NSG and, where the NIC sits in a load
+        # balancer backend pool, live traffic.
         Write-Step 'Creating the placeholder VM from the original image'
         $osDiskSku = $osDiskManifest.SkuName
         if ([string]::IsNullOrWhiteSpace($osDiskSku)) { $osDiskSku = 'Premium_LRS' }
 
-        $placeholder = New-PlaceholderVmFromImage -Manifest $manifest -ConfigParameters $configParameters -NicId $nic.Id `
+        $placeholderSubnetId = $nic.IpConfigurations[0].Subnet.Id
+        $placeholderNsgId = $null
+        if ($nic.NetworkSecurityGroup) { $placeholderNsgId = $nic.NetworkSecurityGroup.Id }
+
+        $temporaryNic = New-TemporaryPlaceholderNic -NicName ("{0}-placeholder-nic" -f $TargetVmName) `
+            -ResourceGroupName $effectiveResourceGroupName -Location $effectiveLocation `
+            -SubnetId $placeholderSubnetId -NetworkSecurityGroupId $placeholderNsgId
+
+        Assert-SourceVmNotRunning -Manifest $manifest -Action 'Creating the replacement VM' -Force $Force.IsPresent
+
+        $placeholder = New-PlaceholderVmFromImage -Manifest $manifest -ConfigParameters $configParameters -NicId $temporaryNic.Id `
             -OsDiskSizeGB ([int]$restoredOsDisk.DiskSizeGB) -OsDiskStorageAccountType $osDiskSku `
             -ResourceGroupName $effectiveResourceGroupName -Location $effectiveLocation
 
         Write-Step 'Swapping in the restored OS disk'
-        $placeholderOsDiskId = Invoke-OsDiskSwap -ResourceGroupName $effectiveResourceGroupName -VmName $TargetVmName -RestoredOsDisk $restoredOsDisk
+        $placeholderOsDiskId = Invoke-OsDiskSwap -ResourceGroupName $effectiveResourceGroupName -VmName $TargetVmName -RestoredOsDisk $restoredOsDisk -Caching $osDiskManifest.Caching
 
         Write-Step 'Attaching the restored data disks'
         Add-DataDisksToExistingVm -ResourceGroupName $effectiveResourceGroupName -VmName $TargetVmName -DataDisk $restoredDataDisks -TargetVmSize $TargetVmSize
 
+        Write-Step 'Moving the VM onto the production network interface'
+        Set-VmPrimaryNetworkInterface -ResourceGroupName $effectiveResourceGroupName -VmName $TargetVmName -NicId $nic.Id
+
+        try {
+            $null = Remove-AzNetworkInterface -Name $temporaryNic.Name -ResourceGroupName $effectiveResourceGroupName -Force -ErrorAction Stop
+            Write-Ok ("Deleted the temporary placeholder NIC '{0}'." -f $temporaryNic.Name)
+        }
+        catch {
+            Write-Warning ("Could not delete the temporary NIC '{0}'. {1}" -f $temporaryNic.Name, $_.Exception.Message)
+            Add-ManualChecklistItem ("Delete the leftover temporary NIC '{0}'." -f $temporaryNic.Name)
+        }
+
         if ($placeholderOsDiskId -and -not $KeepPlaceholderOsDisk) {
             try {
                 $placeholderDiskName = Get-ResourceNameFromResourceId -ResourceId $placeholderOsDiskId
+
+                # Never delete on the strength of a computed ID alone. Confirm the VM now
+                # holds the RESTORED disk, and that the disk about to be removed is detached.
+                $confirm = Get-AzVM -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName -ErrorAction Stop
+                if ($confirm.StorageProfile.OsDisk.ManagedDisk.Id -ne $restoredOsDisk.Id) {
+                    throw ("The VM's OS disk is '{0}', not the restored disk. The swap did not take effect; refusing to delete anything." -f $confirm.StorageProfile.OsDisk.ManagedDisk.Id)
+                }
+
+                $placeholderDisk = Get-AzDisk -ResourceGroupName (Get-ResourceGroupNameFromResourceId -ResourceId $placeholderOsDiskId) -DiskName $placeholderDiskName -ErrorAction Stop
+                if ('' + $placeholderDisk.DiskState -ne 'Unattached') {
+                    throw ("The placeholder disk reports state '{0}' rather than Unattached; refusing to delete it." -f $placeholderDisk.DiskState)
+                }
+
                 $null = Remove-AzDisk -ResourceGroupName (Get-ResourceGroupNameFromResourceId -ResourceId $placeholderOsDiskId) -DiskName $placeholderDiskName -Force -ErrorAction Stop
                 Write-Ok ("Deleted the now-detached placeholder OS disk '{0}'." -f $placeholderDiskName)
             }
@@ -1902,12 +2220,33 @@ try {
         }
 
         Write-Step 'Creating the VM'
+
+        # Azure has no way to create a VM in a stopped state: New-AzVM boots it. So the
+        # source must be confirmed down at THIS moment, not at preflight.
+        Assert-SourceVmNotRunning -Manifest $manifest -Action 'Creating the replacement VM' -Force $Force.IsPresent
+
         $null = New-AzVM -ResourceGroupName $effectiveResourceGroupName -Location $effectiveLocation -VM $vmConfig -ErrorAction Stop
     }
 
     $createdVm = Get-AzVM -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName -ErrorAction Stop
     Register-CreatedResource -Type 'VirtualMachine' -Name $createdVm.Name -Id $createdVm.Id
     Write-Ok ("VM '{0}' created." -f $TargetVmName)
+
+    # Extensions and SQL Server registration are installed by the in-guest Azure VM agent, so
+    # they need the VM RUNNING. The ImageFirstSwap path leaves it deallocated after the swap,
+    # so bring it up here. It is shut down again at the end unless -StartVm was given.
+    $currentPowerState = Get-VmPowerState -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName
+    if ($currentPowerState -ne 'PowerState/running') {
+        Write-Detail 'Starting the replacement VM so the guest agent can install extensions.'
+        try {
+            $null = Start-AzVM -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName -ErrorAction Stop
+            Write-Ok 'Replacement VM is running.'
+        }
+        catch {
+            Write-Warning ("Could not start the replacement VM: {0}" -f $_.Exception.Message)
+            Add-ManualChecklistItem 'The replacement VM would not start, so no extension or SQL registration step could run. Start it by hand and rerun those steps.'
+        }
+    }
 
     # ---------------------------------------------------------------- Post-create
     Write-Step 'Applying post-create configuration'
@@ -1916,8 +2255,21 @@ try {
     if ($systemAssignedRequested) {
         try {
             $identityType = 'SystemAssigned'
-            if ($userAssignedIds.Count -gt 0) { $identityType = 'SystemAssignedUserAssigned' }
-            $null = Update-AzVM -ResourceGroupName $effectiveResourceGroupName -VM $createdVm -IdentityType $identityType -ErrorAction Stop
+            $identityParameters = @{
+                ResourceGroupName = $effectiveResourceGroupName
+                VM                = $createdVm
+                ErrorAction       = 'Stop'
+            }
+
+            if ($userAssignedIds.Count -gt 0) {
+                # Sending SystemAssignedUserAssigned without also re-sending the identity
+                # list drops the user-assigned identities that were attached at creation.
+                $identityType = 'SystemAssignedUserAssigned'
+                $null = Add-SupportedParameter -Splat $identityParameters -CmdletName 'Update-AzVM' -ParameterName 'IdentityId' -Value $userAssignedIds
+            }
+
+            $identityParameters.IdentityType = $identityType
+            $null = Update-AzVM @identityParameters
             Write-Ok 'System-assigned managed identity enabled.'
             Add-ManualChecklistItem 'The system-assigned identity has a NEW principal ID. Re-grant every role assignment, Key Vault access policy and database login that was given to the old VM identity.'
         }
@@ -1998,18 +2350,36 @@ try {
     }
 
     # ---------------------------------------------------------------- Power state
+    # The guest has necessarily booted by now - Azure cannot create or configure a VM without
+    # running it - so the cutover has effectively happened. What remains is deciding whether
+    # to leave it up.
+    $vmStarted = $false
     if ($StartVm) {
-        if ($sourceStillExists -and $sourcePowerState -ne 'PowerState/deallocated' -and $sourcePowerState -ne 'PowerState/stopped' -and -not $Force) {
-            Write-Warning 'Refusing to start the replacement VM while the source VM is still running. Deallocate the source, then start this one.'
+        $vmStarted = ((Get-VmPowerState -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName) -eq 'PowerState/running')
+        if ($vmStarted) {
+            Write-Ok 'Replacement VM is running, as requested.'
         }
-        elseif ($PSCmdlet.ShouldProcess($TargetVmName, 'Start the replacement VM')) {
-            $null = Start-AzVM -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName -ErrorAction Stop
-            Write-Ok 'Replacement VM started.'
+        else {
+            Write-Warning 'The replacement VM is not running despite -StartVm. Start it by hand.'
+        }
+    }
+    elseif ($PSCmdlet.ShouldProcess($TargetVmName, 'Deallocate the replacement VM now that configuration is complete')) {
+        Write-Detail 'Deallocating the replacement VM so it is not left running unattended.'
+        try {
+            $null = Stop-AzVM -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName -Force -ErrorAction Stop
+            Write-Ok 'Replacement VM deallocated. Start it when you are ready to cut over.'
+        }
+        catch {
+            Write-Warning ("The replacement VM could not be deallocated: {0}" -f $_.Exception.Message)
+            Add-ManualChecklistItem 'The replacement VM is RUNNING and could not be stopped automatically. Shut it down if you are not cutting over yet.'
         }
     }
     else {
-        Write-Detail 'The replacement VM has been created but NOT started. Start it when you are ready to cut over, and only once the source VM is deallocated.'
+        $vmStarted = ((Get-VmPowerState -ResourceGroupName $effectiveResourceGroupName -Name $TargetVmName) -eq 'PowerState/running')
+        Write-Warning 'Deallocation declined; the replacement VM is left running.'
     }
+
+    Add-ManualChecklistItem 'The replacement guest booted during this run, because Azure cannot create or configure a VM without starting it. Treat the moment this script created the VM as the real cutover point: the guest has already registered in DNS and Active Directory and, on a SQL Server VM, started SQL Server.'
 
     # ---------------------------------------------------------------- Report
     Write-Step 'Result'
@@ -2020,7 +2390,7 @@ try {
     Write-Detail ("NIC           : {0}" -f $nic.Name)
     Write-Detail ("Backup        : {0}" -f $(if ($backupApplied) { 'enabled' } else { 'NOT enabled' }))
     Write-Detail ("SQL VM        : {0}" -f $(if ($sqlApplied) { 'registered' } else { 'not registered' }))
-    Write-Detail ("Extensions    : {0} re-added" -f $appliedExtensions.Count)
+    Write-Detail ("Extensions    : {0} re-added" -f (Get-SafeArray -InputObject $appliedExtensions).Count)
 
     if ($script:ManualChecklist.Count -gt 0) {
         Write-Host ''
@@ -2047,15 +2417,16 @@ try {
         NicId                         = $nic.Id
         OsDiskName                    = $restoredOsDisk.Name
         DataDiskNames                 = @($restoredDataDisks | ForEach-Object { $_.Disk.Name })
-        Started                       = $StartVm.IsPresent
+        Started                       = $vmStarted
         BackupProtectionApplied       = $backupApplied
         SqlRegistrationApplied        = $sqlApplied
         PatchSettingsApplied          = $patchSettingsApplied
-        ExtensionsApplied             = @($appliedExtensions)
-        DataCollectionRulesApplied    = @($appliedDcr)
-        MaintenanceAssignmentsApplied = @($appliedMaintenance)
-        CreatedResources              = @($script:CreatedResources)
-        ManualChecklist               = @($script:ManualChecklist)
+        ExtensionsApplied             = (Get-SafeArray -InputObject $appliedExtensions)
+        DataCollectionRulesApplied    = (Get-SafeArray -InputObject $appliedDcr)
+        MaintenanceAssignmentsApplied = (Get-SafeArray -InputObject $appliedMaintenance)
+        CreatedResources              = (Get-SafeArray -InputObject $script:CreatedResources)
+        ManualChecklist               = (Get-SafeArray -InputObject $script:ManualChecklist)
+        TranscriptPath                = $script:TranscriptPath
     }
 }
 catch {
@@ -2076,6 +2447,7 @@ catch {
 }
 finally {
     Restore-AzContextState -Context $originalContext
+    Stop-RunTranscript
 }
 
 #endregion

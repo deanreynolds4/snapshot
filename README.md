@@ -42,15 +42,25 @@ place — do not use this toolkit.
 | Az PowerShell modules | See below. |
 
 ```powershell
-Install-Module -Name Az.Accounts, Az.Compute, Az.Network -Scope CurrentUser -Repository PSGallery -Force
+# Required. The rebuild script calls Get-AzResourceGroup before anything else, so
+# Az.Resources is not optional there.
+Install-Module -Name Az.Accounts, Az.Compute, Az.Network, Az.Resources -Scope CurrentUser -Repository PSGallery -Force
 
-# Needed for the corresponding manifest sections; each is optional and degrades gracefully.
-Install-Module -Name Az.RecoveryServices, Az.SqlVirtualMachine, Az.Maintenance, Az.Monitor, Az.Resources, Az.ResourceGraph -Scope CurrentUser -Repository PSGallery -Force
+# Needed for the corresponding manifest sections. The capture script degrades gracefully
+# without them; the rebuild script hard-fails up front if a section it is about to replay
+# needs a module you do not have.
+Install-Module -Name Az.RecoveryServices, Az.SqlVirtualMachine, Az.Maintenance, Az.Monitor -Scope CurrentUser -Repository PSGallery -Force
+
+# Optional. Az.ResourceGraph makes VM lookup a single indexed query instead of a scan of
+# every subscription. Az.Storage is only needed to reattach boot diagnostics to a specific
+# storage account rather than to managed storage.
+Install-Module -Name Az.ResourceGraph, Az.Storage -Scope CurrentUser -Repository PSGallery -Force
 ```
 
-A missing optional module is reported as `Skipped` in the manifest rather than silently
-producing an empty section — but a skipped section is **not** replayed, so install them all
-before a real migration.
+A missing optional module is recorded as `Skipped` in the manifest rather than silently
+producing an empty section — and both the rebuild and the comparison report put every
+`Skipped` or `Failed` section on the manual checklist, because a section that was never
+captured cannot be replayed and must not read as a clean result.
 
 Permissions: Contributor on the VM's resource group, plus Backup Contributor on the
 Recovery Services vault (which is often in a different resource group).
@@ -67,8 +77,9 @@ Recovery Services vault (which is often in a different resource group).
 | `compare-vm-fidelity.ps1` | **Verify.** Diffs the replacement against the manifest and reports what did not carry over. Read-only. |
 | `vm-rebuild-common.ps1` | Shared helpers. Dot-sourced; not run directly. |
 
-Every script supports `-WhatIf` and `-Confirm`. Every script that changes anything is
-idempotent to the extent of refusing to overwrite something that already exists.
+Every script that changes anything supports `-WhatIf` and `-Confirm`, and refuses to
+overwrite a resource that already exists. `compare-vm-fidelity.ps1` has neither, because it
+only reads.
 
 ---
 
@@ -87,20 +98,39 @@ patching isn't set correctly ... for specialized, generalized and restored VMs."
 | Mode | How it works | Patching outcome | Cost |
 |---|---|---|---|
 | `AttachOsDisk` *(default)* | Attaches the restored OS disk directly. | **Scheduled patching cannot be re-established.** On-demand assessment and patching still work. | Simplest, fastest. |
-| `ImageFirstSwap` | Creates a throwaway VM from the source's *original platform image* (so it has a real `osProfile` carrying the source's patch settings), deallocates it, then swaps the restored OS disk in. | **Patch settings preserved.** | ~15–20 min extra, plus a few constraints. |
+| `ImageFirstSwap` | Creates a throwaway VM from the source's *original platform image* (so it has a real `osProfile` carrying the source's patch settings), deallocates it, then swaps the restored OS disk in. | **`patchMode`, `assessmentMode`, `enableHotpatching` and `enableAutomaticUpdates` are replayed**, so scheduled patching can be re-established. | ~15–20 min extra, plus the constraints below. |
 
-`ImageFirstSwap` requires:
+`ImageFirstSwap` requires, all checked as preflight blockers before anything is created:
 
-- the manifest to have recorded an `ImageReference` (absent if the source VM was *itself*
-  built from a specialized disk — the script tells you and stops);
-- the restored OS disk and the placeholder disk to be the **same size** (handled
-  automatically);
-- matching Hyper-V generation and security type (checked in preflight).
+- the manifest to have recorded an `ImageReference` — absent if the source VM was *itself*
+  built from a specialized disk, in which case there is no image provenance to reproduce and
+  you must use `AttachOsDisk`;
+- the manifest to record the source OS disk size, so the placeholder disk can be built to
+  match — an OS disk swap requires both disks to be the same size;
+- the source not to be a Confidential VM, whose OS disk is bound to platform-managed
+  confidential state that a swap does not carry.
 
-A caveat worth knowing before you choose it: after the swap the VM model's `computerName`
-and `adminUsername` describe the throwaway placeholder, not the running guest. Both are
-create-time-only properties and cannot be corrected. It is cosmetic — the guest keeps its
-real name from the restored disk — but it will look odd in the portal forever.
+Hyper-V generation matches by construction, because the placeholder is built from the same
+image the source VM came from.
+
+Three caveats worth knowing before you choose it:
+
+- After the swap the VM model's `computerName` and `adminUsername` describe the throwaway
+  placeholder, not the running guest. Both are create-time-only and cannot be corrected. The
+  guest keeps its real name from the restored disk, so this is mostly cosmetic — but the
+  portal's *Reset password* feature acts on the model's `adminUsername`, so it will target
+  an account that does not exist in the running guest.
+- `bypassPlatformSafetyChecksOnUserSchedule` — the flag that distinguishes *your* maintenance
+  window from Azure-orchestrated patching — is captured but is **not** set by this script.
+  Set it in Azure Update Manager after cutover, or Azure may reboot the VM on its own
+  schedule.
+- Azure cannot create a VM in a stopped state, so the placeholder does boot briefly. It is
+  created on a **temporary NIC with a dynamic address**, never on the production NIC, so a
+  blank Windows install cannot claim your production IP, inherit your NSG rules, or answer
+  load balancer health probes. The temporary NIC is deleted once the real one is attached.
+
+Extensions, backup, maintenance assignments and SQL registration are replayed identically in
+both modes — they are applied after the VM exists, so the restore mode does not affect them.
 
 **If Azure Update Manager scheduled patching matters to you, use `ImageFirstSwap`.**
 Attaching a maintenance configuration to an `AttachOsDisk` VM *appears* to succeed and then
@@ -133,8 +163,14 @@ Optionally rehearse the whole rebuild on a live VM without an outage:
 .\save-vm-snapshot-manifest.ps1 -VmName SQLPROD01 -ConsistencyMode RestorePoint
 ```
 
-A VM restore point captures all disks as one set while the VM keeps running. Good for a
-dry run into an isolated subnet; **not** what you cut over from.
+A VM restore point captures all disks as one set while the VM keeps running. Good for a dry
+run into an isolated subnet; **not** what you cut over from.
+
+Note that the rebuild still refuses to run while the source VM is powered on, because
+creating a VM boots it. To rehearse the rebuild end to end without an outage you need a
+different target: a copy of the manifest pointing at a scratch resource group, and
+`-Force` to acknowledge that the source is deliberately left running. Do that only into an
+isolated subnet, and never start the result on the production network.
 
 ### Step 1 — Pre-cutover checks (in the guest, before the window)
 
@@ -187,8 +223,9 @@ Add `-DetachPublicIp` if you also need the public IP moved.
 Creates nothing. Verifies among other things that the target size exists in the region and
 zone, that it **actually has a temp disk** (`MaxResourceVolumeMB > 0` — otherwise the whole
 migration is pointless and it blocks), that it supports premium storage / encryption at host
-/ Trusted Launch as required, that the disk controller type is compatible, that the names
-are free, and that the source VM is deallocated.
+/ Trusted Launch as required, that the disk controller type is compatible, that the target VM
+name is free, that `ImageFirstSwap`'s own preconditions hold if you chose it, and that the
+source VM is shut down. Disk and NIC name collisions are caught later, at creation time.
 
 Resolve every **BLOCKER**. Read every **WARNING**.
 
@@ -201,8 +238,19 @@ Resolve every **BLOCKER**. Read every **WARNING**.
     -RestoreMode ImageFirstSwap -UseSourcePrivateIp
 ```
 
-The replacement is created **stopped**. It prints a numbered manual checklist of everything
-it could not do for you.
+**This step is the real cutover moment.** Azure cannot create or configure a VM without
+running it: extensions and SQL Server registration are installed by the in-guest agent, so
+the guest must boot. By the time this step finishes, the replacement has already registered
+in DNS and Active Directory and, on a SQL Server VM, started SQL Server.
+
+The script therefore re-checks that the source VM is shut down at that exact moment — not at
+preflight, which may be an hour old — and refuses to proceed if it is running. When
+everything is configured it **deallocates the replacement again** unless you passed
+`-StartVm`, so nothing is left running unattended. The two machines are never online
+together.
+
+It prints a numbered manual checklist of everything it could not do for you, and writes a
+transcript next to the manifest.
 
 ### Step 6 — First boot and in-guest work
 
@@ -235,13 +283,24 @@ portal-created VMs default the OS disk to *Delete with VM*.
 
 ## Rollback
 
+Rollback always runs in the same order: **free the IP, then restore it, then boot the
+original**. The replacement holds the address until its NIC is gone, so stopping or deleting
+the VM alone is not enough.
+
 | When | How |
 |---|---|
-| Before step 5 | Nothing to undo except the IP: `release-vm-network-address.ps1 -Rollback`. |
-| After step 5, before starting the new VM | Delete the replacement VM and its disks, then roll back the IP. |
-| After the new VM has run | Stop the replacement, roll back the IP, start the source VM. Any data written to the replacement since cutover is lost — the source VM's disks are frozen at snapshot time. |
+| Before step 5 | `.\release-vm-network-address.ps1 -Rollback -HandoverPath .\<vm>-ip-handover-<stamp>.json`, then `Start-AzVM` on the source. |
+| After step 5, before starting the replacement | Delete the replacement VM **and its NIC** (the NIC is what holds the address), then run the rollback above. Its disks can be deleted at your leisure. |
+| After the replacement has run | Deallocate the replacement, delete it and its NIC, run the rollback, then start the source. Any data written to the replacement since cutover is lost — the source VM's disks are frozen at snapshot time. |
 
-The source VM, its disks and the snapshots are never touched by any script in this toolkit.
+If you used `-ReuseSourceNic`, there is no IP to roll back — but there is also no source VM
+to go back to, because that mode requires it to have been deleted first. Treat `-ReuseSourceNic`
+as a one-way door.
+
+**What the toolkit does and does not touch on the source side.** No script ever deletes the
+source VM, its disks or the snapshots. Two scripts do modify the source, both deliberately
+and both reversibly: `save-vm-snapshot-manifest.ps1 -DeallocateVm` shuts it down, and
+`release-vm-network-address.ps1` re-IPs its primary NIC (undone with `-Rollback`).
 
 ---
 
@@ -252,14 +311,33 @@ plan, security type with Secure Boot and vTPM, encryption at host, proximity pla
 capacity reservation group (when subscription and region are unchanged), user-assigned
 managed identities, `userData`, disk controller type, UltraSSD and hibernation capability.
 
-Disks: SKU, size, zone, caching, write accelerator, disk encryption set and encryption type,
-performance tier, bursting, provisioned IOPS/throughput, max shares, network access policy,
-Hyper-V generation, tags — **all restated explicitly**, because a disk created from a
-snapshot inherits nothing but the bytes.
+Disks: SKU, size, zone, caching, disk encryption set and encryption type, performance tier,
+bursting, provisioned IOPS/throughput, max shares, network access policy, Hyper-V generation
+and tags — **all restated explicitly**, because a disk created from a snapshot inherits
+nothing but the bytes.
 
-Networking: subnet, NSG, private IP, public IP, accelerated networking, IP forwarding,
-DNS servers, and a best-effort reapplication of application security group and load balancer
-backend pool membership.
+Two are conditional rather than unconditional. Write accelerator is only reapplied when the
+target size is M-series, since no other family supports it. Provisioned IOPS and throughput
+are only reapplied for Premium SSD v2 and Ultra disks, which are the only types that carry
+them. Anything the installed Az module version is too old to express is reported as a warning
+rather than silently dropped.
+
+Networking: subnet, NSG, accelerated networking, IP forwarding, DNS servers, and a
+best-effort reapplication of application security group and load balancer backend pool
+membership.
+
+The private and public IP are **not** automatic — they are opt-in, because claiming them
+requires the source to have released them first:
+
+| You want | Pass | Prerequisite |
+|---|---|---|
+| The original private IP | `-UseSourcePrivateIp` | `release-vm-network-address.ps1` has run |
+| A specific private IP | `-PrivateIpAddress <ip>` | that address is free |
+| The original public IP | `-AttachSourcePublicIp` | `release-vm-network-address.ps1 -DetachPublicIp` has run |
+| Everything, exactly | `-ReuseSourceNic` | the source VM has been **deleted** |
+
+Without one of these the replacement gets a newly allocated dynamic private IP, and preflight
+warns you about it.
 
 Attached resources: VM extensions (except those noted below), boot diagnostics, Azure Backup
 protection, Azure Update Manager VM-scoped maintenance assignments, SQL VM registration with
@@ -377,7 +455,7 @@ recreated. If the manifest reports `SqlWorkloadBackup`, re-register the containe
 | Error | Meaning |
 |---|---|
 | `Unable to resize the VM since changing from resource disk to non-resource disk VM size and vice-versa is not allowed` | The constraint this toolkit exists for. |
-| `Parameter 'osProfile' is not allowed` | Something tried to set an OS profile on a specialized-disk create. Expected in `AttachOsDisk` mode. |
+| `Parameter 'osProfile' is not allowed` | An OS profile was sent on a specialized-disk create. This toolkit never does that, so seeing it means a real failure — most likely a hand-edited command. It is the reason `AttachOsDisk` cannot carry patch settings, not something you should expect to see. |
 | `Changing property 'osProfile' is not allowed` (409) | An attempt to add patch settings to an already-created specialized VM. Not recoverable; rebuild with `ImageFirstSwap`. |
 | `The prerequisites to patch your machine were not met` | A maintenance assignment on a VM without `osProfile` patch settings. |
 | `UserErrorMigrationFromTrustedLaunchVMToNonTrustedVMNotAllowed` | Security type mismatch when re-protecting in the same vault. Match the source exactly. |
